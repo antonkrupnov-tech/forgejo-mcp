@@ -120,10 +120,25 @@ func (t *RetryTransport) sleep(ctx context.Context, d time.Duration) error {
 
 // RoundTrip implements http.RoundTripper.
 func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// A request may only be retried if its body can be replayed: either
+	// there is no body, or GetBody gives us a fresh one per attempt.
+	// Streaming bodies (multipart uploads) have GetBody == nil; re-sending
+	// them after the first attempt consumed the reader would upload a
+	// silently truncated file, so we must not retry those.
+	replayable := req.Body == nil || req.GetBody != nil
+
 	attempts := t.maxAttempts()
 	for i := 1; ; i++ {
-		res, err := t.inner().RoundTrip(req)
-		if !t.retryable(req, err, res) || i == attempts {
+		r := req
+		if i > 1 {
+			var err error
+			r, err = t.replayRequest(req)
+			if err != nil {
+				return nil, err
+			}
+		}
+		res, err := t.inner().RoundTrip(r)
+		if !t.retryable(req, replayable, err, res) || i == attempts {
 			return res, err
 		}
 		// The rejected response is discarded; its body must be drained
@@ -136,8 +151,26 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 }
 
+// replayRequest builds the attempt request for a retry: a clone of the
+// original carrying a fresh copy of the body. RoundTrippers must not modify
+// the request handed to them, so every attempt after the first uses a clone.
+func (t *RetryTransport) replayRequest(req *http.Request) (*http.Request, error) {
+	r := req.Clone(req.Context())
+	if req.Body != nil {
+		body, err := req.GetBody()
+		if err != nil {
+			return nil, err
+		}
+		r.Body = body
+	}
+	return r, nil
+}
+
 // retryable reports whether this outcome deserves another attempt.
-func (t *RetryTransport) retryable(req *http.Request, err error, res *http.Response) bool {
+func (t *RetryTransport) retryable(req *http.Request, replayable bool, err error, res *http.Response) bool {
+	if !replayable {
+		return false
+	}
 	if err != nil {
 		// Transport-level failure: the request never completed.
 		return true

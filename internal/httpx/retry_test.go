@@ -7,10 +7,12 @@
 package httpx_test
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -183,5 +185,84 @@ func TestRetryTransport_NeverRetriesOther4xx(t *testing.T) {
 				t.Errorf("server saw %d requests, want exactly 1", got)
 			}
 		})
+	}
+}
+
+// nonSeekReader makes http.NewRequest leave GetBody nil, mimicking a
+// streaming upload (like a multipart release-asset body).
+type nonSeekReader struct{ io.Reader }
+
+func TestRetryTransport_DoesNotRetryNonReplayableBody(t *testing.T) {
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	// Body consumed on the first attempt; without GetBody we cannot replay
+	// it. Retrying would send a truncated (or empty) upload and silently
+	// corrupt the file, so the 503 must be passed through untouched.
+	req, err := http.NewRequest(http.MethodPost, srv.URL, nonSeekReader{strings.NewReader("payload")})
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	tr := &httpx.RetryTransport{BaseDelay: time.Millisecond}
+	client := &http.Client{Transport: tr}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", resp.StatusCode)
+	}
+	if got := atomic.LoadInt32(&requests); got != 1 {
+		t.Errorf("server saw %d requests, want exactly 1", got)
+	}
+}
+
+func TestRetryTransport_ReplaysBodyOnRetry(t *testing.T) {
+	const payload = "hello payload"
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		if len(bodies) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, string(b))
+	}))
+	defer srv.Close()
+
+	// bytes.NewReader gives the request a GetBody, so the body is
+	// replayable and the retry must carry the full payload again.
+	req, err := http.NewRequest(http.MethodPost, srv.URL, bytes.NewReader([]byte(payload)))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	tr := &httpx.RetryTransport{BaseDelay: time.Millisecond}
+	client := &http.Client{Transport: tr}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("server saw %d requests, want exactly 2", len(bodies))
+	}
+	if bodies[1] != payload {
+		t.Errorf("retried request body = %q, want %q", bodies[1], payload)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	if string(respBody) != payload {
+		t.Errorf("response body = %q, want %q", respBody, payload)
 	}
 }
