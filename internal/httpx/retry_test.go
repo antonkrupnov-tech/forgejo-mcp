@@ -9,6 +9,7 @@ package httpx_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -449,5 +450,103 @@ func TestRetryTransport_ExponentialBackoff(t *testing.T) {
 		if d < lo || d > hi {
 			t.Errorf("sleep %d = %v, want in [%v, %v]", i, d, lo, hi)
 		}
+	}
+}
+
+// Context cancellation must abandon the retry loop promptly instead of
+// sleeping through the remaining attempts.
+func TestRetryTransport_ContextCancelAbortsRetries(t *testing.T) {
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	// Long base delay: without cancellation-aware sleeping this test would
+	// take minutes.
+	tr := &httpx.RetryTransport{BaseDelay: time.Hour}
+	client := &http.Client{Transport: tr}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		// Cancel while the transport is in its first backoff sleep.
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+
+	start := time.Now()
+	_, err = client.Do(req)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("Do: want error from cancelled context, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Do error = %v, want it to wrap context.Canceled", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("cancellation took %v to take effect, want prompt abort", elapsed)
+	}
+	if got := atomic.LoadInt32(&requests); got != 1 {
+		t.Errorf("server saw %d requests, want 1 (cancelled during first sleep)", got)
+	}
+}
+
+// When every attempt fails with a retryable status, the caller gets a clear
+// error naming the final status instead of a silently-swallowed response.
+func TestRetryTransport_ExhaustedRetriesReportFinalStatus(t *testing.T) {
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	tr := &httpx.RetryTransport{
+		MaxAttempts: 2,
+		BaseDelay:   time.Millisecond,
+		Sleep:       func(context.Context, time.Duration) error { return nil },
+	}
+	client := &http.Client{Transport: tr}
+
+	_, err := client.Get(srv.URL)
+	if err == nil {
+		t.Fatal("want error after exhausting retries, got nil response")
+	}
+	if !strings.Contains(err.Error(), "429") {
+		t.Errorf("error %q does not mention the final status 429", err)
+	}
+	if !strings.Contains(err.Error(), "2") {
+		t.Errorf("error %q does not mention the attempt count", err)
+	}
+	if got := atomic.LoadInt32(&requests); got != 2 {
+		t.Errorf("server saw %d requests, want exactly 2", got)
+	}
+}
+
+// A dead endpoint must not loop forever: transport errors are retried up to
+// MaxAttempts and then reported.
+func TestRetryTransport_ExhaustedTransportErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := srv.URL
+	srv.Close() // nothing is listening now
+
+	tr := &httpx.RetryTransport{
+		MaxAttempts: 2,
+		BaseDelay:   time.Millisecond,
+		Sleep:       func(context.Context, time.Duration) error { return nil },
+	}
+	client := &http.Client{Transport: tr}
+
+	_, err := client.Get(deadURL)
+	if err == nil {
+		t.Fatal("want error when the endpoint is dead")
+	}
+	if !strings.Contains(err.Error(), "2 attempts") {
+		t.Errorf("error %q should mention the attempt count", err)
 	}
 }

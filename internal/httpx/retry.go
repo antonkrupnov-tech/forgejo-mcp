@@ -13,6 +13,7 @@ package httpx
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
@@ -141,8 +142,20 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			}
 		}
 		res, err := t.inner().RoundTrip(r)
-		if !t.retryable(req, replayable, err, res) || i == attempts {
+		if !t.retryable(req, replayable, err, res) {
 			return res, err
+		}
+		if i == attempts {
+			// Out of attempts while the outcome still looked transient.
+			// Handing the 429 back silently would make callers (and the
+			// SDK) treat rate limiting as data; report clearly instead.
+			drain(res)
+			if err != nil {
+				return nil, fmt.Errorf("httpx: %s %s: giving up after %d attempts: %w",
+					req.Method, req.URL, attempts, err)
+			}
+			return nil, fmt.Errorf("httpx: %s %s: giving up after %d attempts, last status %s",
+				req.Method, req.URL, attempts, res.Status)
 		}
 		// The rejected response is discarded; its body must be drained
 		// and closed or the underlying connection is never returned to
