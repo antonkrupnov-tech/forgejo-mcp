@@ -26,6 +26,24 @@ func TestLabel_ToMarkdown(t *testing.T) {
 			required: []string{"bug", "ff0000", "Something isn't working"},
 		},
 		{
+			name:     "numeric ID badge is rendered",
+			label:    &Label{Label: testLabel()},
+			required: []string{"[id:1]"},
+		},
+		{
+			// Worked example from the spec: badge goes after the bold name,
+			// before the colour. IDs are per instance, so the exact number
+			// only ever comes from the API.
+			name: "ID badge precedes colour badge",
+			label: &Label{Label: &forgejo.Label{
+				ID:          7,
+				Name:        "bug",
+				Color:       "ff0000",
+				Description: "Something isn't working",
+			}},
+			required: []string{"**bug** `[id:7]` `#ff0000` - Something isn't working"},
+		},
+		{
 			name:     "nil label",
 			label:    &Label{Label: nil},
 			required: []string{"Invalid label"},
@@ -59,6 +77,11 @@ func TestLabelList_ToMarkdown(t *testing.T) {
 				},
 			},
 			required: []string{"bug", "ff0000", "Something isn't working", "enhancement", "a2eeef", "New feature or request"},
+		},
+		{
+			name:     "label list includes numeric ID badge",
+			labels:   LabelList{&Label{Label: testLabel()}},
+			required: []string{"- **bug** `[id:1]` `#ff0000` - Something isn't working"},
 		},
 		{
 			name:     "empty label list",
