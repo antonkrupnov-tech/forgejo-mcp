@@ -550,3 +550,38 @@ func TestRetryTransport_ExhaustedTransportErrors(t *testing.T) {
 		t.Errorf("error %q should mention the attempt count", err)
 	}
 }
+
+// The resilient client must fix the three operational gaps: no overall
+// timeout, no retry, and Go's MaxIdleConnsPerHost default of 2.
+func TestNewResilientClient(t *testing.T) {
+	client := httpx.NewResilientClient()
+
+	if client.Timeout <= 0 {
+		t.Errorf("client.Timeout = %v, want a positive overall timeout", client.Timeout)
+	}
+
+	rt, ok := client.Transport.(*httpx.RetryTransport)
+	if !ok {
+		t.Fatalf("Transport = %T, want *httpx.RetryTransport", client.Transport)
+	}
+	inner, ok := rt.Inner.(*http.Transport)
+	if !ok {
+		t.Fatalf("RetryTransport.Inner = %T, want *http.Transport", rt.Inner)
+	}
+
+	if inner.MaxIdleConnsPerHost <= 2 {
+		t.Errorf("MaxIdleConnsPerHost = %d, want well above Go's default of 2", inner.MaxIdleConnsPerHost)
+	}
+	if inner.MaxIdleConns <= 0 {
+		t.Errorf("MaxIdleConns = %d, want a raised pool limit", inner.MaxIdleConns)
+	}
+	if inner.IdleConnTimeout <= 0 {
+		t.Errorf("IdleConnTimeout = %v, want a finite idle timeout", inner.IdleConnTimeout)
+	}
+	if inner.TLSHandshakeTimeout <= 0 {
+		t.Errorf("TLSHandshakeTimeout = %v, want a finite handshake timeout", inner.TLSHandshakeTimeout)
+	}
+	if inner.DialContext == nil {
+		t.Error("DialContext = nil, want a dialer with an explicit connect timeout")
+	}
+}
