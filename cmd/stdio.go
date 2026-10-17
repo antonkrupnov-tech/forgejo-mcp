@@ -12,6 +12,7 @@ import (
 	"os"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/raohwork/forgejo-mcp/internal/httpx"
 	"github.com/raohwork/forgejo-mcp/tools"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -40,10 +41,23 @@ Example:
 			os.Exit(1)
 		}
 
-		cl, err := tools.NewClient(base, token, "", nil)
+		resilient := httpx.NewResilientClient()
+		cl, err := tools.NewClient(base, token, "", resilient)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating SDK client: %v\n", err)
-			os.Exit(1)
+			// The startup version check is advisory. It performs one API
+			// call, so a rate-limited or briefly unreachable Forgejo must
+			// not abort the whole MCP server. If the SDK still handed us a
+			// usable client (unknown-version errors do), start with it;
+			// otherwise rebuild skipping the check, the same established
+			// behaviour as http multiuser mode.
+			fmt.Fprintf(os.Stderr, "warning: Forgejo version check failed, continuing without it: %v\n", err)
+			if cl == nil {
+				cl, err = tools.NewClient(base, token, "9", resilient)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error creating SDK client: %v\n", err)
+					os.Exit(1)
+				}
+			}
 		}
 
 		server := createServer(cl)
