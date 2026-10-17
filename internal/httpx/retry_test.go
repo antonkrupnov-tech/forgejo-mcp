@@ -8,6 +8,7 @@ package httpx_test
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -264,5 +265,189 @@ func TestRetryTransport_ReplaysBodyOnRetry(t *testing.T) {
 	respBody, _ := io.ReadAll(resp.Body)
 	if string(respBody) != payload {
 		t.Errorf("response body = %q, want %q", respBody, payload)
+	}
+}
+
+// TestRetryTransport_HonoursRetryAfterDeltaSeconds verifies that a
+// server-supplied Retry-After (delta-seconds form) overrides our own backoff.
+func TestRetryTransport_HonoursRetryAfterDeltaSeconds(t *testing.T) {
+	var slept []time.Duration
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&requests, 1) == 1 {
+			w.Header().Set("Retry-After", "7")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		fmt.Fprint(w, "ok")
+	}))
+	defer srv.Close()
+
+	tr := &httpx.RetryTransport{
+		// BaseDelay tiny; if Retry-After is ignored the recorded sleep
+		// would be ~1ms instead of 7s.
+		BaseDelay: time.Millisecond,
+		Sleep: func(_ context.Context, d time.Duration) error {
+			slept = append(slept, d)
+			return nil
+		},
+	}
+	client := &http.Client{Transport: tr}
+
+	resp, err := client.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if len(slept) != 1 {
+		t.Fatalf("recorded %d sleeps, want 1", len(slept))
+	}
+	if slept[0] != 7*time.Second {
+		t.Errorf("sleep = %v, want exactly 7s from Retry-After", slept[0])
+	}
+}
+
+// Retry-After: 0 is valid ("retry now") and must not be treated as absent.
+func TestRetryTransport_HonoursRetryAfterZero(t *testing.T) {
+	var slept []time.Duration
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&requests, 1) == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		fmt.Fprint(w, "ok")
+	}))
+	defer srv.Close()
+
+	tr := &httpx.RetryTransport{
+		BaseDelay: 5 * time.Second, // would show up in slept if Retry-After were ignored
+		Sleep: func(_ context.Context, d time.Duration) error {
+			slept = append(slept, d)
+			return nil
+		},
+	}
+	client := &http.Client{Transport: tr}
+
+	resp, err := client.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if len(slept) != 1 || slept[0] != 0 {
+		t.Errorf("sleeps = %v, want exactly [0s] from Retry-After: 0", slept)
+	}
+}
+
+func TestRetryTransport_HonoursRetryAfterHTTPDate(t *testing.T) {
+	var slept []time.Duration
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&requests, 1) == 1 {
+			w.Header().Set("Retry-After", time.Now().UTC().Add(3*time.Second).Format(http.TimeFormat))
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		fmt.Fprint(w, "ok")
+	}))
+	defer srv.Close()
+
+	tr := &httpx.RetryTransport{
+		BaseDelay: time.Millisecond,
+		Sleep: func(_ context.Context, d time.Duration) error {
+			slept = append(slept, d)
+			return nil
+		},
+	}
+	client := &http.Client{Transport: tr}
+
+	resp, err := client.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer resp.Body.Close()
+	if len(slept) != 1 {
+		t.Fatalf("recorded %d sleeps, want 1", len(slept))
+	}
+	// HTTP-date has one-second resolution; accept anything in (2s, 3s].
+	if slept[0] <= 2*time.Second || slept[0] > 3*time.Second {
+		t.Errorf("sleep = %v, want a duration derived from the HTTP-date (~3s)", slept[0])
+	}
+}
+
+// A hostile or buggy Retry-After must be clamped so it cannot stall the client.
+func TestRetryTransport_ClampsHugeRetryAfter(t *testing.T) {
+	var slept []time.Duration
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&requests, 1) == 1 {
+			w.Header().Set("Retry-After", "999999") // ~11.5 days
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		fmt.Fprint(w, "ok")
+	}))
+	defer srv.Close()
+
+	tr := &httpx.RetryTransport{
+		RetryAfterLimit: 2 * time.Second,
+		Sleep: func(_ context.Context, d time.Duration) error {
+			slept = append(slept, d)
+			return nil
+		},
+	}
+	client := &http.Client{Transport: tr}
+
+	resp, err := client.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer resp.Body.Close()
+	if len(slept) != 1 || slept[0] > 2*time.Second {
+		t.Errorf("sleeps = %v, want clamped to <= 2s", slept)
+	}
+}
+
+// Backoff grows exponentially with attempt count and stays within jittered bounds.
+func TestRetryTransport_ExponentialBackoff(t *testing.T) {
+	var slept []time.Duration
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests) // never succeeds
+	}))
+	defer srv.Close()
+
+	tr := &httpx.RetryTransport{
+		BaseDelay:   100 * time.Millisecond,
+		MaxDelay:    300 * time.Millisecond,
+		MaxAttempts: 4,
+		Sleep: func(_ context.Context, d time.Duration) error {
+			slept = append(slept, d)
+			return nil
+		},
+	}
+	client := &http.Client{Transport: tr}
+
+	_, err := client.Get(srv.URL)
+	// Exhaustion behaviour is covered by its own test; here we only inspect delays.
+	_ = err
+	if len(slept) != 3 {
+		t.Fatalf("recorded %d sleeps, want 3 (one per retry)", len(slept))
+	}
+	// Exponential: 100ms, 200ms, capped at 300ms; jitter must keep each delay
+	// in [cap/2, cap] of the un-jittered window for that attempt.
+	windows := []time.Duration{100 * time.Millisecond, 200 * time.Millisecond, 300 * time.Millisecond}
+	for i, d := range slept {
+		hi := windows[i]
+		lo := hi / 2
+		if d < lo || d > hi {
+			t.Errorf("sleep %d = %v, want in [%v, %v]", i, d, lo, hi)
+		}
 	}
 }

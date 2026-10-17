@@ -14,7 +14,10 @@ package httpx
 import (
 	"context"
 	"io"
+	"math/rand"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -145,7 +148,15 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		// and closed or the underlying connection is never returned to
 		// the pool and leaks.
 		drain(res)
-		if serr := t.sleep(req.Context(), t.baseDelay()); serr != nil {
+		delay := t.backoff(i)
+		if res != nil {
+			// A server that sends Retry-After knows better than our
+			// generic backoff; honour it (clamped) when parseable.
+			if ra, ok := retryAfterDelay(res.Header, time.Now(), t.retryAfterLimit()); ok {
+				delay = ra
+			}
+		}
+		if serr := t.sleep(req.Context(), delay); serr != nil {
 			return nil, serr
 		}
 	}
@@ -198,6 +209,55 @@ func isIdempotent(method string) bool {
 		return true
 	}
 	return false
+}
+
+// backoff returns the pause after the n-th failed attempt (n >= 1): an
+// exponential window Base*2^(n-1) capped at MaxDelay, with "equal jitter"
+// (half the window fixed, half randomised) to spread out concurrent MCP tool
+// calls that all got 429 at once.
+func (t *RetryTransport) backoff(n int) time.Duration {
+	base := t.baseDelay()
+	window := base
+	for i := 1; i < n && window < t.maxDelay(); i++ {
+		window *= 2
+	}
+	if window > t.maxDelay() {
+		window = t.maxDelay()
+	}
+	half := window / 2
+	return half + time.Duration(rand.Int63n(int64(half)+1))
+}
+
+// retryAfterDelay parses a Retry-After header, supporting both the
+// delta-seconds and the HTTP-date forms. The result is clamped to limit so a
+// hostile or buggy value cannot stall the client for hours. A missing or
+// unparseable value reports ok=false and the caller falls back to backoff.
+func retryAfterDelay(h http.Header, now time.Time, limit time.Duration) (time.Duration, bool) {
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0, false
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs < 0 {
+			return 0, false // not RFC-conformant; treat as absent
+		}
+		d := time.Duration(secs) * time.Second
+		if d > limit {
+			d = limit
+		}
+		return d, true
+	}
+	if when, err := http.ParseTime(v); err == nil {
+		d := when.Sub(now)
+		if d < 0 {
+			d = 0 // clock skew or a past date: retry immediately
+		}
+		if d > limit {
+			d = limit
+		}
+		return d, true
+	}
+	return 0, false
 }
 
 // drain consumes and closes res.Body so the connection can be reused.
