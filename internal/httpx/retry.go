@@ -142,7 +142,29 @@ func (t *RetryTransport) retryable(req *http.Request, err error, res *http.Respo
 		// Transport-level failure: the request never completed.
 		return true
 	}
-	return res.StatusCode == http.StatusTooManyRequests
+	switch res.StatusCode {
+	case http.StatusTooManyRequests, // 429: the nginx rate limiter; explicitly invited to retry
+		http.StatusServiceUnavailable: // 503: rejected at the edge, the app never saw the request
+		return true
+	case http.StatusBadGateway, http.StatusGatewayTimeout:
+		// 502/504 mean the gateway gave up; the application may have
+		// partially processed the request. Only retry when re-sending
+		// cannot duplicate an effect, i.e. for idempotent methods.
+		return isIdempotent(req.Method)
+	}
+	return false
+}
+
+// isIdempotent reports whether repeating the method is safe. It covers the
+// methods RFC 9110 defines as idempotent; POST, PATCH and unknown methods are
+// not.
+func isIdempotent(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete,
+		http.MethodOptions, http.MethodTrace:
+		return true
+	}
+	return false
 }
 
 // drain consumes and closes res.Body so the connection can be reused.
