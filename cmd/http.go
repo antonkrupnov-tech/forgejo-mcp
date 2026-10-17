@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/raohwork/forgejo-mcp/internal/httpx"
 	"github.com/raohwork/forgejo-mcp/tools"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -55,16 +56,20 @@ Example:
 		}
 		singleMode := token != ""
 
+		// Shared resilient client: retry on 429/edge-5xx, overall timeout,
+		// and a pool sized for parallel tool calls.
+		resilient := httpx.NewResilientClient()
+
 		var cl *tools.Client
 		if singleMode {
-			c, err := tools.NewClient(base, token, "", nil)
+			c, err := tools.NewClient(base, token, "", resilient)
 			if err != nil {
 				fmt.Printf("Error creating SDK client: %v\n", err)
 				os.Exit(1)
 			}
 			cl = c
 		} else {
-			cl, _ = tools.NewClient(base, "", "9", nil)
+			cl, _ = tools.NewClient(base, "", "9", resilient)
 		}
 
 		getServer := func(q *http.Request) *mcp.Server {
@@ -78,7 +83,7 @@ Example:
 				if strings.HasPrefix(myToken, "Bearer ") {
 					myToken = myToken[7:]
 				}
-				c, err := tools.NewClient(base, myToken, "", nil)
+				c, err := tools.NewClient(base, myToken, "", resilient)
 				if err == nil {
 					mycl = c
 				}
